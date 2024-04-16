@@ -1,0 +1,1158 @@
+---
+title: "NYPD Shooting Incident Data Report"
+author: "A. Lenters"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Overview {#sec-overview}
+
+Welcome to my analysis of the **NYPD Shooting Incident Data (Historic)** dataset.[^1] In this analysis, I will build a model to predict the monthly number of shooting incident reports in New York City. This model could help departments plan staffing levels.
+
+## Contents
+
+-   [Setup](#sec-setup) performs setup, including user definitions (e.g. data locations) and libraries.
+-   [Verbs](#sec-verbs) creates custom verbs for data wrangling, for use with `dplyr`'s pipes.
+-   [Wrangle Data](#sec-wrangle-data) imports, tidies and transforms the data.
+-   [Exploratory Data Analysis](#sec-eda) uses visualization to look for trends in the data and get model ideas.
+-   [Data summary](#sec-summary) summarizes the data and ensures there are no missing values.
+-   [Modelling](#sec-modelling) progressively fits models to the data, guided by graphical model evaluation.
+-   [Conclusion](#sec-conclusion) summarizes my findings and next steps, and discusses potential sources of bias.
+-   [Appendix](#sec-appendix) shows my session information and the final model's performance/diagnostic plots.
+
+## Note to peer graders
+
+You can find my data source overview in [Wrangle Data](#sec-wrangle-data), my missing data check in [Data summary](#sec-summary), my plots in [Exploratory Data Analysis](#sec-eda)/[Modelling](#sec-modelling), my model fits in [Modelling](#sec-modelling), and my discussion of bias in [Conclusion](#sec-conclusion).
+
+\pagebreak
+
+# Setup {#sec-setup}
+
+## Setup $\blacktriangleright$ Packages
+
+Necessary packages are loaded via `library()`. Optional ones are loaded via `require()`.
+
+You can install the necessary packages on your machine by running `install.packages(c("tidyverse", "broom", "knitr", "modelr"))` in the console, and following the prompt to restart R (if requested). You may want to run this command even if you have them installed already, as I have found rendering works better with current versions of the packages. (You can see exactly which versions I used in the [Appendix A - Session Info](#appendix-a) section in my PDF version of this report.)
+
+```{r setup}
+# necessary packages
+library(rlang)
+library(tidyverse)
+library(broom)
+library(knitr)
+library(modelr)
+
+# should already be part of tidyverse, but loading it just in case
+library(lubridate)
+
+# optional packages
+require(pdftools)
+
+set.seed(1)
+```
+
+## Setup $\blacktriangleright$ User definitions
+
+Here, users of this report can set the locations and backup locations of the files used in this analysis. The four URLs that have been provided are publicly accessible, so no changes should be necessary.
+
+```{r user-defintions}
+nypd_data_url <- paste0("https://data.cityofnewyork.us/api/views/",
+                        "833y-fsy8/rows.csv?accessType=DOWNLOAD")
+
+nypd_data_url_bak <- paste0("https://github.com/alenters/dsaaf-nypd/raw/",
+                            "main/backup_data/",
+                            "NYPD_Shooting_Incident_Data__Historic_.csv")
+
+nyc_temps_url <- paste0("https://www.weather.gov/media/okx/Climate/",
+                        "CentralPark/monthlyannualtemp.pdf")
+
+nyc_temps_url_bak <- paste0("https://github.com/alenters/dsaaf-nypd/raw/",
+                            "main/backup_data/",
+                            "nyc_monthly_temps__historic.csv")
+```
+
+## Setup $\blacktriangleright$ Fixed definitions
+
+Below are constants I use in my analysis, which you can optionally adjust. But the document should knit on any machine with the values I have set.
+
+```{r fixed-definitions}
+colors <- c(incident_reports = "black", temperature = "black", 
+            "Trend" = "darkblue", "Seasonal" = "#2fccff",
+            "Actual" = "gray", "Predicted" = "blue", "Residual" = "red")
+
+suggested_theme_base_size <- switch (
+	knitr::pandoc_to(),
+	latex = 9,
+	html = 11,
+	revealjs = 14,
+	10 # conservative default
+)
+
+perf_plot_ymin <- -99
+perf_plot_ymax <- 249
+covid_start_date <- ymd("2020-03-01")
+covid_end_date <- ymd("2020-12-31")
+```
+
+\pagebreak
+
+# Verbs {#sec-verbs}
+
+All verbs used in the analysis will be created in this section. I have given them self-explanatory names, so you can skip this section and proceed to [Wrangle Data](#sec-wrangle-data), and return here to look at details as necessary.
+
+## Verbs $\blacktriangleright$ Import
+
+Along with the file we were asked to analyze (`NYPD_Shooting_Incident_Data__Historic_.csv`), I have identified two external sources I want to use in my analysis (monthly temperatures, and NYPD police commissioner names). This section creates all of the functions necessary to import the three data sources.
+
+```{r import-shooting-data}
+read_historic_shooting_data <- function(url) {
+  read_csv(url,
+              na = c("", "NA", "UNKNOWN", "U"),
+              col_types = cols_only(
+                INCIDENT_KEY = col_integer(),
+                OCCUR_DATE = col_date(format = "%m/%d/%Y"),
+                STATISTICAL_MURDER_FLAG = col_logical()
+              )) %>% 
+    rename(incident_key = INCIDENT_KEY,
+           date = OCCUR_DATE,
+           statistical_murder_flag = STATISTICAL_MURDER_FLAG)
+}
+
+get_historic_shooting_data <- function() {
+  tryCatch(read_historic_shooting_data(nypd_data_url),
+         error = function(w){
+           warning(paste("Could not read historic shooting data file from",
+                         "source. Reverting to github backup."))
+           read_historic_shooting_data(nypd_data_url_bak)
+         })
+}
+```
+
+```{r import-temperature-data}
+read_backup_historic_temperatures <- function(url = nyc_temps_url_bak) {
+  read_csv(url,
+           col_types = cols(
+             date = col_date(format = "%Y-%m-%d"),
+             temperature = col_double()
+             ))
+}
+
+read_historic_temperatures_from_source <- function (url = nyc_temps_url) {
+  tmp_filename <- tempfile("data", fileext = c(".pdf"))[[1]]
+  download.file(url, tmp_filename)
+  
+  headers <- c("YEAR", "01", "02", "03", "04", "05", "06", "07", "08", "09", 
+               "10", "11", "12", "ANNUAL")
+  pages <- pdftools::pdf_text(tmp_filename)
+
+  .is_data_row <- function(cells) {
+    if ("Average" %in% cells | "Last" %in% cells | "YEAR" %in% cells) {
+      FALSE # known identifiers of headers
+    } else if (length(cells) == 14) {
+      TRUE # expected format of data rows
+    } else {
+      FALSE # ignore anything unexpected
+    }
+  }
+  
+  .process_row <- function(row) {
+    cells <- unlist(strsplit(row, "\\s+"))
+    if (.is_data_row(cells)) {
+      as_tibble_row(setNames(cells, headers))
+    } else {
+      NA
+    }
+  }
+
+  .process_page <- function(page) {
+    scan(textConnection(page), what = "character", sep = "\n") %>%
+      map(.process_row) %>%
+      purrr::discard(~ all(is.na(.x))) %>%
+      reduce(union_all)
+  }
+
+  map(pages, .process_page) %>%
+    reduce(union_all) %>% 
+    select(!c(ANNUAL)) %>%
+    pivot_longer(cols = -c(YEAR), 
+                 names_to = c("MONTHNAME"), 
+                 values_to = "temperature") %>%
+    unite(date, YEAR:MONTHNAME) %>%
+    mutate(date = parse_date(date, format = "%Y_%m")) %>%
+    mutate(temperature = as.double(temperature))
+}
+
+get_historic_temperatures <- function() {
+  if(require(pdftools)) {
+    tryCatch(read_historic_temperatures_from_source(),
+           error = function(w){
+             warning(paste("Could not read historic temperature data file from",
+                           "source. Reverting to github backup."))
+             read_backup_historic_temperatures()
+           })
+  } else {
+    warning(paste("Reading backup temperatures file from github because", 
+                  "pdftools is not installed."))
+    read_backup_historic_temperatures()
+  }
+}
+```
+
+```{r import-commissioner-data}
+# https://en.wikipedia.org/wiki/New_York_City_Police_Commissioner
+# commissioner_start_date: inclusive
+# commissioner_end_date: exclusive
+get_historic_police_commissioners <- function() {
+  tribble(
+  ~commissioner, ~commissioner_start_date, ~commissioner_end_date,
+  "Raymond Walter Kelly", "2002-01-01", "2013-12-31",
+  "William Joseph Bratton", "2014-01-01", "2016-09-15",
+  "James P. O'Neill", "2016-09-16", "2019-11-30",
+  "Dermot F. Shea", "2019-12-01", "2021-12-31",
+  "Keechant Sewell", "2022-01-01", "2023-06-30",
+  "Edward A. Caban", "2023-07-01", "2024-04-10" # date of data capture
+) %>%
+    mutate(
+      across(commissioner, as.factor),
+      across(starts_with("commissioner_"), as.Date)
+      )
+}
+```
+
+## Verbs $\blacktriangleright$ Tidy
+
+```{r collapse-incident-reports}
+collapse_incident_reports <- function(df) {
+  df %>% group_by(incident_key, date) %>% 
+    summarize(incident_reports = 1,
+              murdered_victims = sum(statistical_murder_flag),
+              injured_victims = sum(!statistical_murder_flag),
+              .groups = "drop")
+}
+```
+
+## Verbs $\blacktriangleright$ Transform
+
+```{r safe-lookup-join}
+safe_lookup_join <- function (x, y, join_cols) {
+  y_lookup <- y %>%
+                inner_join(x %>%
+                             select(all_of(join_cols)) %>%
+                             unique(),
+                           by = join_cols,
+                           relationship = "one-to-one")
+  inner_join(x, 
+             y_lookup,
+             by = join_cols,
+             relationship = "many-to-one",
+             unmatched = "error")
+}
+```
+
+```{r roll_up}
+roll_up <- function(df, ..., date_unit = "week") {
+  df %>%
+    mutate(date = floor_date(date, unit = date_unit)) %>%
+    group_by(pick(where(~!is.numeric(.x)))) %>%
+    summarize(..., .groups = "drop")
+}
+```
+
+```{r add-temperatures}
+add_temperatures <- function(df) {
+  df %>% 
+    safe_lookup_join(get_historic_temperatures(), c("date"))
+}
+```
+
+```{r add-commissioners}
+add_commissioners <- function(df) {
+  df %>%
+    left_join(get_historic_police_commissioners(), 
+              by = join_by(between(x$date, 
+                           y$commissioner_start_date, 
+                           y$commissioner_end_date))) %>%
+    select(!c(commissioner_start_date, commissioner_end_date))
+}
+```
+
+## Verbs $\blacktriangleright$ EDA
+
+```{r timeseries-base}
+timeseries_base <- function(df, .date_col, .ts_col, 
+                            ..., 
+                            theme_base_size = suggested_theme_base_size,
+                            color_mapping = colors) {
+  df %>%
+    ggplot(mapping = aes(x = {{ .date_col }})) +
+      theme_minimal(base_size = theme_base_size) +
+      theme(legend.position = "none") +
+      scale_color_manual(values = color_mapping) +
+      geom_line(aes(y = {{ .ts_col }}, 
+                    color = rlang::englue("{{ .ts_col }}")), 
+                linewidth = 1.1, 
+                alpha = 0.8)
+}
+```
+
+```{r perform-decomposition}
+do_decomp <- function(df, .col, .date_col) {
+  date_col <- pull(df, {{ .date_col }})
+  decompose_col = pull(df, {{ .col }})
+  min_date <- min(date_col)
+  max_date <- max(date_col)
+  decomposed <- ts(decompose_col, 
+                   start = c(year(min_date), month(min_date)), 
+                   end = c(year(max_date), month(max_date)), 
+                   frequency = 12) %>%
+                     decompose()
+  df %>% 
+    mutate(IR_seasonal = tibble(decomposed$seasonal)[[1]]) %>% 
+    mutate(IR_trend = tibble(decomposed$trend)[[1]]) %>% 
+    mutate(IR_resid = tibble(decomposed$random)[[1]])
+}
+
+```
+
+```{r visualize-decomposition}
+plot_decomp <- function(df, 
+                        min_date = NULL, 
+                        max_date = NULL, 
+                        ..., 
+                        .colorize_col = NULL,
+                        theme_base_size = suggested_theme_base_size,
+                        color_mapping = colors) {
+  data_to_visualize <- df
+  
+  if (!is_null(min_date)) {
+    data_to_visualize <- data_to_visualize %>%
+      dplyr::filter(date >= min_date)
+  }
+  if (!is_null(max_date)) {
+    data_to_visualize <- data_to_visualize %>%
+      dplyr::filter(date <= max_date)
+  }
+  
+  data_to_visualize %>%
+    ggplot(aes(x = date)) + 
+      theme_minimal(base_size = theme_base_size) +
+      theme(legend.position = "top", legend.title = element_blank()) +
+      scale_color_manual(values = color_mapping) +
+      geom_bar(aes(y = IR_resid, color = "Residual"), 
+               fill = color_mapping["Residual"], 
+               stat = "identity", 
+               linewidth = 0, 
+               alpha = 0.8) +
+      geom_line(aes(y = IR_seasonal, color = "Seasonal"), 
+                linewidth = 1.1, 
+                alpha = 0.8) +
+      geom_line(aes(y = IR_trend, color = "Trend"), 
+                linetype = "dotted",
+                linewidth = 1, 
+                alpha = 0.8) +
+      labs(
+        ...,
+        color = "Legend")
+}
+
+```
+
+## Verbs $\blacktriangleright$ Model
+
+```{r performance-plot-helpers}
+.adjust_pred_for_poisson <- function(df, .col) {
+  df %>%
+    mutate({{ .col }} := exp({{ .col }}))
+}
+
+.adjust_resid_for_poisson <- function(df, .col, .actual_col) {
+  df %>%
+    mutate({{ .col }} := {{ .actual_col }} - 
+           {{ .actual_col }}/exp({{ .col }}))
+}
+
+make_poisson_predictions <- function(df, .model, .actual_col) {
+  df %>%
+    modelr::add_predictions(.model) %>%
+    .adjust_pred_for_poisson(pred) %>%
+    modelr::add_residuals(.model) %>%
+    .adjust_resid_for_poisson(resid, {{ .actual_col }})
+}
+```
+
+## Verbs $\blacktriangleright$ Communicate
+
+```{r tidy-helpers}
+has_na <- function(df) {
+  sum(is.na(df)) > 0
+}
+```
+
+```{r present-table}
+present_table <- function(df, ..., n = 4, caption = "") {
+  knitr::kable(head(df, 
+                    n = n),
+               align = "l",
+               caption = caption)
+}
+```
+
+```{r model-adj-rs}
+model_adj_rs <- function(model, format = "number") {
+  ret <- round(broom::glance(model)$adj.r.squared, 4)
+  if (format == "percent") {
+    ret <- rlang::englue("{ret * 100}%")
+  }
+  ret
+}
+```
+
+```{r plot-model-performance}
+plot_model_performance <- function(df, .model, .actual_col, 
+                                   ..., 
+                                   subtitle = "Model performance",
+                                   theme_base_size = suggested_theme_base_size,
+                                   color_mapping = colors,
+                                   ymin = NA,
+                                   ymax = NA) {
+  m <- broom::glance(.model)
+  df %>%
+    make_poisson_predictions(.model, {{ .actual_col }}) %>%
+    ggplot(mapping = aes(x = date)) +
+      theme_minimal(base_size = theme_base_size) +
+      theme(legend.position = "top", legend.title = element_blank()) +
+      scale_color_manual(values = color_mapping) +
+      ylim(ymin, ymax) +
+      geom_line(aes(y = {{ .actual_col }}, color = "Actual"), 
+                linewidth = 1.1, 
+                alpha = 0.7) +
+      geom_line(aes(y = pred, color = "Predicted"), 
+                linewidth = 0.8) +
+      geom_bar(aes(y = resid, color = "Residual"),
+               fill = color_mapping["Residual"], 
+               linewidth = 0, 
+               alpha = 0.9, 
+               stat="identity") +
+      labs(x = "Month",
+           y = "Number of incident reports",
+           color = "Legend",
+           subtitle = subtitle,
+           caption = paste0("Adj. R squared: ", round(m$adj.r.squared[[1]], 4), 
+                            ", AIC: ", round(m$AIC[[1]]), 
+                            ", BIC: ", round(m$BIC[[1]])),
+           ...)
+}
+```
+
+```{r date-span-str}
+date_span_str <- function(start_date, end_date) {
+  sd_month <- format(start_date, "%B")
+  sd_year <- format(start_date, "%Y")
+  ed_month <- format(end_date, "%B")
+  ed_year <- format(end_date, "%Y")
+  
+  if (sd_year == ed_year) {
+    rlang::englue("{ sd_month} to { ed_month } { ed_year }")
+  } else {
+    rlang::englue("{ sd_month} { sd_year } to { ed_month } { ed_year }")
+  }
+}
+```
+
+\pagebreak
+
+# Wrangle Data {#sec-wrangle-data}
+
+I will now use the verbs I created in [Verbs](#sec-verbs), to import, tidy, transform and visualize the data, in preparation for modelling.
+
+## Wrangle $\blacktriangleright$ Data Source
+
+The data source I will be using is the **NYPD Shooting Incident Data (Historic)** dataset.[^2]
+
+Each time a shooting incident (that results in injury or death) is reported in New York City, an incident report is filed. The incidents from 2006 - 2022 are available in this historic file. The column definitions (provided by the dataset's Data Dictionary[^3]) are shown below. I have decided to start with a high-level analysis, looking at monthly counts of incident reports, so I only need to use a few of these columns. I have marked the columns I will use in this analysis with \*\*.
+
+| Column Name                 | Description                                                                                                                                                                        |
+|:-----------------------------------|:-----------------------------------|
+| \*\*INCIDENT_KEY            | Randomly generated persistent ID for each incident                                                                                                                                 |
+| \*\*OCCUR_DATE              | Exact date of the shooting incident                                                                                                                                                |
+| OCCUR_TIME                  | Exact time of the shooting incident                                                                                                                                                |
+| BORO                        | Borough where the shooting incident occurred                                                                                                                                       |
+| PRECINCT                    | Precinct where the shooting incident occurred                                                                                                                                      |
+| JURISDICTION_CODE           | Jurisdiction where the shooting incident occurred. Jurisdiction codes 0(Patrol), 1(Transit) and 2(Housing) represent NYPD whilst codes 3 and more represent non NYPD jurisdictions |
+| LOCATION_DESC               | Location of the shooting incident                                                                                                                                                  |
+| \*\*STATISTICAL_MURDER_FLAG | Shooting resulted in the victim’s death which would be counted as a murder                                                                                                         |
+| PERP_AGE_GROUP              | Perpetrator’s age within a category                                                                                                                                                |
+| PERP_SEX                    | Perpetrator’s sex description                                                                                                                                                      |
+| PERP_RACE                   | Perpetrator’s race description                                                                                                                                                     |
+| VIC_AGE_GROUP               | Victim’s age within a category                                                                                                                                                     |
+| VIC_SEX                     | Victim’s sex description                                                                                                                                                           |
+| VIC_RACE                    | Victim’s race description                                                                                                                                                          |
+| X_COORD_CD                  | Midblock X-coordinate for New York State Plane Coordinate System, Long Island Zone, NAD 83, units feet (FIPS 3104)                                                                 |
+| Y_COORD_CD                  | Midblock Y-coordinate for New York State Plane Coordinate System, Long Island Zone, NAD 83, units feet (FIPS 3104)                                                                 |
+
+: Column definitions for the `NYPD Shooting Incident Data (Historic)` dataset. {#tbl-col-defs}
+
+## Wrangle $\blacktriangleright$ Import
+
+Let's start by reading the data in from the source csv. The `get_historic_shooting_data()` verb I created for this purpose selects only the columns I want to use in this analysis. Importing a subset of columns is cleanly achieved by using `cols_only()` to create the `col_types` argument to `read_csv()`.
+
+```{r wrangle, cache=FALSE}
+shooting_data <- get_historic_shooting_data()
+```
+
+Let's have a quick look at the data:
+
+```{r glimpse-shooting-data}
+glimpse(shooting_data)
+```
+
+## Wrangle $\blacktriangleright$ Tidy
+
+In this section, I will check the NYPD Historic Shooting dataframe to confirm that it is tidy.
+
+### Tidy $\blacktriangleright$ Are there any missing values?
+
+We want to avoid having any missing values in the dataframe, because they will cause issues in any calculation or plot they are included in.
+
+```{r na-check}
+if(shooting_data %>% has_na()) {
+  stop("NA values found in dataset. Please fix.")
+}
+```
+
+Currently, there are no missing (`NA`) values in the data, but I have included a `stop()` condition in case some appear in future. The columns I am using (`incident_key`, `date` and `statistical_murder_flag`) are so central to the dataset that they should not be missing, and I cannot a priori say how missing values should be handled. The ideal fix would be to correct the source file by filling in the missing values. (And in my opinion, for reproducibility purposes, a loud error up front is better than mysterious issues later on caused by the missing values.)
+
+### The three tidiness requirements:
+
+For a tibble to be tidy, three requirements should be met:
+
+1.  Each variable has its own column
+2.  Each observation has its own row
+3.  Each value has its own cell
+
+The book "R For Data Science" notes[^4] that if two of these are true the third is also guaranteed to be true, so I will check the first two.
+
+### Tidy $\blacktriangleright$ Does each variable have its own column?
+
+Short answer: Yes.
+
+```{r tbl-shooting-data-sample}
+shooting_data %>%
+  present_table(caption = "Sample of the shooting data.")
+```
+
+I have chosen to use three columns from the source csv. No variable is spread across multiple columns, and no column contains multiple variables, so this requirement is met.
+
+### Tidy $\blacktriangleright$ Does each observation have its own row?
+
+Short answer: No.
+
+To check this requirement, we need to know what defines an "observation" in this dataset. I would consider each incident to be a single observation. The dataset's official landing page[^5] links to a footnotes PDF, which states (in footnote 3) that incident reports can span multiple rows if multiple victims were involved. This would violate tidy data principles, by giving multiple rows to a single observation. Let's check for this:
+
+```{r tbl-untidy-data-with-duplicates, cache=FALSE}
+duplicates <- shooting_data %>% 
+  count(incident_key, sort = TRUE)
+
+least_tidy_incident_key <- as.integer(duplicates$incident_key[[1]])
+least_tidy_incident_n <- as.integer(duplicates$n[[1]])
+
+duplicates %>%
+  present_table(caption = paste("Top number of data rows used by various",
+                                "`incident_keys` (should be 1 row per",
+                                "`incident_key`)."))
+```
+
+This shows that single incident reports have up to `r least_tidy_incident_n` rows in the dataframe! Let's check the least tidy `incident_key`, `r least_tidy_incident_key`:
+
+```{r tbl-check-specific-incident, cache=FALSE}
+shooting_data %>% 
+  dplyr::filter(incident_key == least_tidy_incident_key) %>%
+  present_table(caption = paste0("Records for a single `incident_key`, ", 
+                                 least_tidy_incident_key, 
+                                 "."),
+                n = Inf)
+```
+
+### Tidy $\blacktriangleright$ Collapse duplicates
+
+In the sample above, all rows for a single `incident_key` have the same `date`, but different values for `statistical_murder_flag`.
+
+I think the best way to modify the tibble to meet requirement 2 is to add two new features to the dataframe: `injured_victims` and `murdered_victims`. This will be handled by logic I defined earlier, in the verb `collapse_incident_reports()`.
+
+```{r tbl-collapsed-duplicates, cache=FALSE}
+tidy_shooting_data <- shooting_data %>% 
+  collapse_incident_reports()
+
+tidy_shooting_data %>%
+  present_table(caption = "Post-collapse, sample of the shooting data.")
+```
+
+Let's re-run our duplicates checks from above:
+
+```{r tbl-refind-duplicates, cache=FALSE}
+tidy_shooting_data %>% 
+  count(incident_key, sort = TRUE) %>%
+  present_table(caption = paste("Post-collapse, top number of data rows used",
+                                "by various `incident_keys`."))
+```
+
+No duplicates!
+
+```{r tbl-recheck-specific-incident, cache=FALSE}
+tidy_confirm <- tidy_shooting_data %>% 
+  dplyr::filter(incident_key == least_tidy_incident_key)
+
+tidy_confirm %>%
+  present_table(caption = paste("Post-collapse, records for the same",
+                                "`incident_key` we looked at earlier."),
+                n = least_tidy_incident_n)
+```
+
+The data for this incident has been tidied up to a single row, with the `r least_tidy_incident_n` victims we found earlier aggregated into a single incident report with `r tidy_confirm$murdered_victims[[1]]` `murdered_victims` and `r tidy_confirm$injured_victims[[1]]` `injured_victims`.
+
+### Done tidying!
+
+The `data` dataframe has been successfully tidied, with one row per observation, and one column per variable, so we can move on to transforming the data to make it work for this particular analysis.
+
+\pagebreak
+
+## Wrangle $\blacktriangleright$ Transform
+
+### Transform $\blacktriangleright$ Roll up monthly
+
+To get a clearer view of trends in the data, I want to roll it up to monthly. I will use the verb I created for this purpose, `roll_up()`. This change will also be helpful later on if we want to bring in additional data, because some data is only available at monthly granularity.
+
+```{r roll-up-data}
+data <- tidy_shooting_data %>%
+  roll_up(incident_reports = sum(incident_reports),
+          murdered_victims = sum(murdered_victims),
+          injured_victims = sum(injured_victims),
+          date_unit = "month")
+```
+
+```{r glimpse-monthly}
+glimpse(data)
+```
+
+\pagebreak
+
+# Exploratory Data Analysis {#sec-eda}
+
+My EDA will primarily reply on visualization to explore the data and look for relationships between variables. I will use the EDA process to generate modelling ideas, which I will use later on during modelling.
+
+## EDA $\blacktriangleright$ Response variable timeseries
+
+Let's look at a timeseries of the number of monthly incident reports:
+
+```{r fig-incident-timeseries, fig.cap="Monthly incident reports timeseries.", out.width="80%"}
+min_year <- min(year(data$date))
+max_year <- max(year(data$date))
+data %>%
+  timeseries_base(date, incident_reports) +
+    labs(title = "NYC Shooting Incident Reports", 
+         subtitle = rlang::englue("Monthly, { min_year } - { max_year }"), 
+         caption = paste("Source: NYPD Shooting Incident Data (Historic)",
+                         "dataset from https://catalog.data.gov/dataset"),
+         x = "Month",
+         y = "Number of incident reports",
+         color = "Legend")
+```
+
+There is a strong yearly cyclical pattern in the number of incident reports. Also, the number of monthly incident reports had been declining during the 2010s, but it jumped up in 2020.
+
+## EDA $\blacktriangleright$ Decompose
+
+We can decompose the `incident_reports` timeseries into three components (`trend` + `seasonal` + `residual`) to formalize the seasonality and trend patterns we've spotted in the data, and gain insights into possible predictors. This decomposition uses the standard R function `decompose()` from the `stats` package, with its default settings.
+
+```{r fig-decomposed-ts, fig.cap="Decomposed incident reports timeseries.", out.width="80%"}
+data %>%
+  do_decomp(incident_reports, date) %>%
+  plot_decomp(min_date = ymd("2007-01-01"), 
+              max_date = ymd("2021-12-01"), 
+              title = "Incident reports = Trend + Seasonal + Residual", 
+              subtitle = "Monthly, 2007 - 2021", 
+              caption = paste("Incident reports timeseries decomposed into",
+                              "Trend + Seasonal + Residual timeseries."), 
+                          x = "Date", 
+                          y = "Number of incident reports")
+```
+
+### Feature engineering
+
+The decomposition suggests some features we can use in our model:
+
+-   Seasonal: The yearly cycle has its peaks in the summertime and its troughs in the winter. Perhaps there is a relation to **temperature**.
+-   Trend: There is a stepwise declining trend over **time** until 2020, where it jumps up. I wonder if these step-changes correspond to changes in leadership in the NYPD (e.g. the **commissioner**)--perhaps due to changes in police operations and/or incident reporting.
+
+## Transform $\blacktriangleright$ Bring in additional data
+
+I will use data on NYC's monthly temperatures[^6] and police commissioners[^7] to explore the questions brought up by the timeseries decomposition. I wrote the verbs `add_temperatures()` and `add_commissioners()` to fetch the data from source and join it to our dataframe.
+
+Internally, `add_temperatures()` uses another verb I wrote called `safe_lookup_join()`, which performs a "lookup join" (adding a new column to an existing dataframe) without any risk of: 1) missing values in the new column, or 2) silently dropping rows from the main dataframe, which are the risks of traditional **left** and **inner** joins. An error will be issued and execution will be halted if the lookup table lacks a value for any row in the main dataframe.
+
+`add_commissioners()` uses a different type of join, due to the nature of the commissioners dataframe, which contains one row per commissioner, with start and end dates. It uses the `between()` overlap helper function inside of the `join_by()` specification to state that each row should be assigned to the commissioner who was active at the time of the incident. This could be performed at daily granularity, but to simplify the data model, I will apply it after aggregating to monthly granularity, so the commissioner for each month will be whoever was in charge at the beginning of the month.
+
+```{r view-rolled-up-data, cache=FALSE}
+glimpse(data)
+```
+
+```{r join-data, cache=FALSE}
+data <- data %>% 
+    add_commissioners() %>%
+    add_temperatures()
+```
+
+Let's have a look at the new dataframe:
+
+```{r glimpse-full-data, cache=FALSE}
+glimpse(data)
+```
+
+## EDA $\blacktriangleright$ Temperature timeseries
+
+```{r fig-temp-timeseries, fig.cap="Monthly average temperature timeseries.", out.width="80%"}
+data %>%
+  timeseries_base(date, temperature) +
+  labs(title = "Temperature timeseries",
+       y = "Avg monthly temperature (°F)")
+```
+
+## EDA $\blacktriangleright$ Incident reports distribution
+
+In order to use linear regression, the response variable should be normally distributed. Let's check the general shape of the distribution for `incident_reports` by using `geom_density()`.
+
+```{r fig-ir-dist, fig.cap="Density plot for `incident reports`.", out.width="80%"}
+data %>%
+  ggplot(aes(x = incident_reports)) +
+    geom_density(linewidth = 1.1, alpha = 0.8) +
+    theme_minimal(base_size = suggested_theme_base_size) + 
+    labs(title = "Number of incident reports is not normally distributed")
+    
+```
+
+This does not look like a normal distribution. On the left side, it has a hard minimum of 0, while the right side is unbounded, with a long tail. Given that the `incident_reports` variable counts events in a fixed time period, it is more likely to follow a **poisson** distribution. A log transform should therefore make it more normal.
+
+```{r fig-log-dist, fig.cap="Density plot for `log(incident reports)`.", out.width="80%"}
+data %>%
+  ggplot(aes(x = log(incident_reports))) +
+    geom_density(linewidth = 1.1, alpha = 0.8) +
+    theme_minimal(base_size = suggested_theme_base_size) +
+    labs(title = "log(Number of incident reports) is more normally distributed")
+    
+```
+
+This does look more normal. I will therefore use `log(incident_reports)` as the response variable.
+
+Next, let's look for relationships between our response variable, `log(incident_reports)`, and features that could be used in the model (`date`, `temperature`, `commissioner`).
+
+## EDA $\blacktriangleright$ log(Incident reports) \~ Temperature
+
+Let's start with the relationship between `log(incident_reports)` and `temperature`.
+
+```{r fig-log-ir-vs-temp, fig.cap="`temperature` vs `log(incident reports)`."}
+data %>%
+  ggplot(aes(x = temperature, y = log(incident_reports))) +
+  geom_point() +
+  geom_smooth(method = "loess", formula = "y ~ x") +
+  theme_minimal(base_size = suggested_theme_base_size) + 
+  labs(title = "How does temperature affect incident report counts?",
+       x = "Avg monthly temperature (°F)",
+       y = "log(Number of incident reports)")
+```
+
+The relationship between `temperature` and `log(incident_reports)` is roughly linear, making `temperature` a great candidate to add to a linear model.
+
+## EDA $\blacktriangleright$ log(Incident reports) \~ Date, Commissioner
+
+Let's look for an interaction between `date` and `commissioner`.
+
+```{r fig-nypd-comm-eda, fig.cap="`commissioner` vs `incident reports`.", out.width="80%"}
+data %>%
+  ggplot(aes(x = date, y = incident_reports)) +
+  geom_line(aes(color = commissioner), linewidth = 1.1) +
+  geom_smooth(aes(group = commissioner), 
+              method = "lm",
+              formula = "y ~ x",
+              se = FALSE,
+              color = "black",
+              linewidth = 0.9,
+              alpha = 0.7,
+              linetype = "dotted") + 
+  theme_minimal(base_size = suggested_theme_base_size) + 
+  theme(legend.position = "top",
+        legend.title = element_blank()) +
+  guides(color = guide_legend(nrow = 2)) +
+  labs(title = paste("NYPD Commissioner seems to influence",
+                     "number of incident reports"),
+       x = "Date", 
+       y = "Number of incident reports")
+```
+
+After fitting separate trend lines for each police Commissioner, there is a fairly clear correspondence between `commissioner` and the step-changes in `incident_reports`. For example, see the abrupt change where James P. O'Neill took over from William Joseph Bratton.
+
+In general, the peaks and troughs of each commissioner's timeseries stay at the same level over time. So if we removed the seasonal component, the remaining trend for each commissioner would be a roughly linear relationship between `date` and `incident_reports`. Therefore, including `date` as a continuous feature and `commissioner` as a factor feature in the model should provide useful information and help improve the model.
+
+## EDA $\blacktriangleright$ Recap
+
+We have ended up with three candidate features for a linear model: `temperature`, `date`, and `commissioner`. We are ready to move onto modelling.
+
+\pagebreak
+
+# Data summary {#sec-summary}
+
+Before moving on to modelling, let's do a quick data summary to make sure there is no missing data.
+
+Here are the columns we ended up with in the dataframe.
+
+```{r glimpse-final-data}
+glimpse(data)
+```
+
+Actually, I am not planning on using `murdered_victims` or `injured_victims`, so those columns can be dropped at this time.
+
+```{r drop-unnecessary-columns}
+data <- data %>%
+  select(!c(murdered_victims, injured_victims))
+```
+
+The remaining columns are:
+
+```{r glimpse-final-data-2}
+glimpse(data)
+```
+
+Let's use `summarize()` to check the range of the data, and check for missing (`NA`) data. For non-numeric columns (`date`, `commissioner`), `min()` , `mean()` and `max()` do not apply, but we can still produce the count columns.
+
+```{r tbl-data-summary}
+data %>%
+  summarize(across(where(is.numeric), 
+                   list(min = min, 
+                        mean = mean,
+                        max = max,
+                        count = ~ sum(!is.na(.x)),
+                        nacount = ~ sum(is.na(.x))
+                        )),
+            across(where(~!is.numeric(.)), 
+                   list(count = ~ sum(!is.na(.x)),
+                        nacount = ~ sum(is.na(.x))
+                        ))
+            ) %>%
+  t() %>%
+  present_table(n = Inf,
+                caption = "Final data summary.")
+```
+
+In addition to the manual check for missing data via summaries, let's repeat the automatic missing value check from earlier, which will halt execution if there are any `NA`s in the data.
+
+```{r na-check-2}
+if(data %>% has_na()) {
+  stop("NA values found in dataset. Please fix.")
+}
+```
+
+\pagebreak
+
+# Modelling {#sec-modelling}
+
+First, I will build separate models from each of the three features. Then, I will look at how we can combine them into a single model.
+
+## Model $\blacktriangleright$ v0: log(Incident reports) \~ temperature
+
+Let's build a model using `temperature` as the only predictor for `log(incident_reports)`.
+
+```{r fig-log-model-temp, fig.cap="Model with one feature: `temperature`.", out.width="80%"}
+# fit the model
+model_v01 <- lm(log(incident_reports) ~ temperature, data)
+
+# generate model performance plot
+data %>% 
+  plot_model_performance(model_v01, 
+                         incident_reports,
+                         title = "log(incident_reports) ~ temperature",
+                         ymin = perf_plot_ymin,
+                         ymax = perf_plot_ymax)
+
+```
+
+As anticipated, this model captures seasonal variation fairly well, but it fails to capture longer-term trends.
+
+\pagebreak
+
+## Model $\blacktriangleright$ v0: log(Incident reports) \~ date
+
+Now let's build a model using `date` as the only predictor for `log(incident_reports)`.
+
+```{r fig-log-model-date, fig.cap="Model with one feature: `date`.", out.width="80%"}
+# fit the model
+model_v02 <- lm(log(incident_reports) ~ date, data)
+
+# generate model performance plot
+data %>% 
+  plot_model_performance(model_v02, 
+                         incident_reports,
+                         title = "log(incident_reports) ~ date ",
+                         ymin = perf_plot_ymin,
+                         ymax = perf_plot_ymax)
+
+```
+
+This model is able to capture some aspects of the longer-term trend, but all the model does is scale and shift the linear variable `date`, so it is not able to handle things such as the increase in incidents from 2020 onwards, or the seasonal oscillations.
+
+\pagebreak
+
+## Model $\blacktriangleright$ v0: log(Incident reports) \~ commissioner
+
+Let's also build a model using `commissioner` as the only predictor for `log(incident_reports)`.
+
+```{r fig-log-model-comm, fig.cap="Model with one feature: `commissioner`.", out.width="80%"}
+# fit the model
+model_v03 <- lm(log(incident_reports) ~ commissioner, data)
+
+# generate model performance plot
+data %>% 
+  plot_model_performance(model_v03, 
+                         incident_reports,
+                         title = "log(incident_reports) ~ commissioner",
+                         ymin = perf_plot_ymin,
+                         ymax = perf_plot_ymax)
+
+```
+
+This model is able to make an upwards adjustment from 2020 onwards, because it turns out there was a change in commissioners between 2019 and 2020. But again, it does not have enough degrees of freedom to capture the seasonal oscillations.
+
+\pagebreak
+
+## Model $\blacktriangleright$ v1: Modelling the trend
+
+Next, let's combine features to create a model that accounts for trends only (not seasonality). Earlier, I hypothesized that the trend we see in `incident_reports` may be related to the passage of time (i.e. `date`), and the police `commissioner` in charge at the time. We can model this relationship as follows:
+
+```{r, echo=FALSE}
+model_v1_caption <- paste("Modelling the trend with a universal slope,",
+                      "and per-commissioner intercepts.")
+```
+
+```{r fig-log-model-without-temp, fig.cap=model_v1_caption, out.width="80%"}
+model_v1 <- lm(log(incident_reports) ~ commissioner + date, data)
+
+data %>% 
+  plot_model_performance(model_v1, 
+                         incident_reports,
+                         title = paste("log(incident_reports) ~ commissioner",
+                                       "+ date"),
+                         ymin = perf_plot_ymin,
+                         ymax = perf_plot_ymax)
+```
+
+This does a decent job of capturing the trend in `incident_reports`, but one problem is that all segments of the line have the same slope. It would be better if each segment could have its own slope.
+
+\pagebreak
+
+## Model $\blacktriangleright$ v2: Improving the trend model with an interaction term
+
+We can achieve per-commissioner slopes by adding an interaction term between `commissioner:date`.
+
+```{r, echo=FALSE}
+model_v2_caption <- paste("A `commissioner:date` interaction term allows for",
+                          "per-commissioner slopes in addition to the",
+                          "per-commnissioner intercepts we had previously.")
+```
+
+```{r fig-log-model-without-temp-separate-slopes, fig.cap=model_v2_caption, out.width="80%"}
+model_v2 <- lm(log(incident_reports) ~ commissioner + commissioner:date, data)
+
+data %>% 
+  plot_model_performance(model_v2, 
+                         incident_reports,
+                         title = paste("log(incident_reports) ~ commissioner",
+                                       "+ commissioner:date"),
+                         ymin = perf_plot_ymin,
+                         ymax = perf_plot_ymax)
+```
+
+This looks better. All line segments have their own slope now. Let's move on to adding seasonality into the model.
+
+\pagebreak
+
+## Model $\blacktriangleright$ v3: Incorporating seasonality
+
+The variable I have in my dataset that potentially explains the seasonal oscillations is `temperature`. Let's add it into the model:
+
+```{r, echo=FALSE}
+model_v3_caption <- paste("Incorporating seasonality with the addition of the",
+                          "temperature term.")
+```
+
+```{r fig-log-model-with-temp, fig.cap=model_v3_caption, out.width="80%"}
+model_v3 <- lm(log(incident_reports) ~ commissioner + commissioner:date + 
+                 temperature, 
+               data)
+
+data %>% 
+  plot_model_performance(model_v3, 
+                         incident_reports,
+                         title = paste("log(incident_reports) ~ commissioner +",
+                                       "commissioner:date + temperature"),
+                         ymin = perf_plot_ymin,
+                         ymax = perf_plot_ymax)
+```
+
+Given that the model only relies on only 3 explanatory variables, an adjusted R squared of `r model_adj_rs(model_v3, format = "percent")`[^8] is great! The model underestimates incident report counts in 2020, but otherwise, it gets close to predicting the correct numbers of incident reports, with no obvious bias towards over- or under-estimating.
+
+### Model weakness analysis
+
+According to the Wikipedia article on the COVID-19 pandemic in NYC,[^9] there were multiple unusual police-related happenings at the start of the pandemic. Firstly, an unusually high percentage of the police force was out sick. Secondly, some prisoners were released early to reduce the risk of them contracting COVID-19. Separately, I know that there were changes to many people's living and employment situations, such as lockdowns, working from home, and increased unemployment. This information is not captured in the simple dataset I have collected, so it is unsurprising that the model struggles to make accurate predictions in this time period.
+
+We can remove the time period in question, to see if model performance is better under "normal" conditions:
+
+## Model $\blacktriangleright$ v3: Performance excluding Covid-19 time period
+
+```{r, echo=FALSE}
+model_v3a_caption <- paste0("Ignoring the anomalous Covid-19/lockdown period,",
+                           " from ", 
+                           date_span_str(covid_start_date, covid_end_date), ".")
+```
+
+```{r fig-log-model-sans-lockdown, fig.cap=model_v3a_caption, out.width="80%"}
+filtered_data <- data %>% 
+  dplyr::filter(date < covid_start_date | date > covid_end_date)
+
+model_v3_filtered <- lm(
+  log(incident_reports) ~ commissioner + commissioner:date + 
+    temperature, 
+  filtered_data)
+
+filtered_data %>% 
+  plot_model_performance(model_v3_filtered, 
+                         incident_reports,
+                         title = paste("log(incident_reports) ~ commissioner +",
+                                       "commissioner:date + temperature"),
+                         subtitle = paste("Model performance excluding the",
+                                          "first 10 months of the pandemic"),
+                         ymin = perf_plot_ymin,
+                         ymax = perf_plot_ymax)
+```
+
+The model's performance did indeed improve to an adjusted R squared of `r model_adj_rs(model_v3_filtered, format = "percent")`.
+
+## Model $\blacktriangleright$ Performance
+
+We can summarize the model and its performance using some standard R functions/visualizations:
+
+### Summary
+
+```{r model-diagnostics-summary, cache=FALSE}
+summary(model_v3_filtered)
+```
+
+### Glance
+
+```{r tbl-model-diag, cache=FALSE}
+broom::glance(model_v3_filtered) %>%
+  t() %>%
+  present_table(n = Inf,
+                caption = paste("Filtered v3 model's performance across",
+                                "various metrics, courtesy of",
+                                "`broom::glance()`."))
+```
+
+### Plots
+
+There are six standard model diagnostics plots that we can draw, just by passing the fitted model into the `plot()` function. Plots are shown in [Appendix B](#appendix-b).
+
+\pagebreak
+
+# Conclusion {#sec-conclusion}
+
+## Conclusion $\blacktriangleright$ Model findings
+
+I built a model to estimate monthly `incident_reports`, using `temperature`, `date`, and NYPD `commissioner` as explanatory variables. I was able to explain `r model_adj_rs(model_v3, format = "percent")` of the variance in `log(incident_reports)` using this approach (`r model_adj_rs(model_v3_filtered, format = "percent")` if the anomalous Covid-19 period from `r date_span_str(covid_start_date, covid_end_date)` is excluded). These findings could be used as the basis for a predictive model, or for more fine-grained analyses (daily data, precise locations, types of incidents, etc).
+
+Follow-up research could dig further into the relationship between `commissioner` and `incident_reports`, to see what is driving it, and whether there are any changes that could be made to data collection or analysis to better reflect the true number of shooting-related incidents in the city.
+
+## Conclusion $\blacktriangleright$ Bias
+
+Bias is important to consider during data analysis and modelling. It may not always be possible (or even desirable) to eliminate *all* bias (see discussion below on model bias). But at a minimum we should aware of possible biases in our work, including personal bias and the biases passed on to us by others (e.g. through the data) so that we can mitigate any negative effects of the biases.
+
+### Bias $\blacktriangleright$ Personal
+
+#### My modelling biases
+
+For this project, we were asked to pay attention to our personal biases, and take steps to mitigate them. I know that in the past, I have had a bias towards creating the "best" model possible. (As I am sure is true for many new data scientists!) I understood "best" to mean:
+
+-   Model performance metrics are as high as they can possibly be. I would want to keep on tuning the model to squeeze out every last drop of performance.
+-   Model is incredibly detailed. I saw being able to predict **hourly** incident report numbers as clearly better than only being able to predict **daily** or **monthly** numbers. And I would have considered making predictions at a **per-borough** level as a better starting place than zooming out to NYC as a **whole**. (After all, we could always add up the borough predictions to get a citywide prediction.)
+
+I think this previous bias towards prioritization of numbers and details came at the expense of gaining a clear understanding of the problem. And possibly even at the expense of developing robust solutions.
+
+#### Mitigation
+
+Therefore, I tried to mitigate my bias tendencies by deliberately staying high-level, predicting monthly incident report numbers for NYC as a whole. (Note that even my choice to use this mitigation strategy was a personal bias!) I think this approach had three additional benefits:
+
+-   Aggregating to monthly and to citywide meant that the law of large numbers was more likely to apply, allowing me to get good performance while using simple models.
+-   This approach allowed me to avoid introducing biases that might have crept into more fine-grained models. For example, if I had included variables such as victim/perpetrator demographics, location, etc, I would have needed to decide how to handle cases of missing values. If I wanted to look at weekdays vs weekends, I would have needed to decide on the definition of "weekend" (e.g. does Sunday night count?) All of those decisions could have been additional sources of bias.
+- By not prioritizing model performance above all else, I was able to land on a parsimonious model (only 3 features, all of which are relatively predictable) that does a good job of explaining the variance in the response variable. Fewer, simpler features means a more robust model that is less likely to break after it is put into production.
+
+### Bias $\blacktriangleright$ Data
+
+#### Problem
+
+Another category of bias is the bias implicit in a dataset. It is tricky to deal with, because without additional information, it may be difficult to detect the bias in the first place. And even if we knew of the existence of some bias, it might not be clear what should be done about it.
+
+For example, what if some demographics of victims or perpetrators are more or less likely to have incident reports filed than others? How could we detect this, and how could we address or compensate for it? Each of those questions is likely the subject of an entire study.
+
+As another example, we saw that there is a strong relationship between `commissioner` and `incident_reports`. Without additional information about how the incident reports data is collected, it is difficult to tell what is responsible for this relationship. Maybe it relates to real-world changes, such as a change in policing policy. Or maybe different commissioners have different standards for data collection, i.e. each commissioner's policies on incident reporting may be a source of bias.
+
+#### Mitigation
+
+To address this issue, I tried to make clear at all stages that I was modelling count of incident **reports** rather than count of incidents themselves, knowing that there may be a biased difference between the two. I think determining causality here would require outside research that is beyond the scope of this project. But at least my analysis highlighted the relationship, so that it can be followed up on.
+
+## Conclusion $\blacktriangleright$ Next steps
+
+If I were to continue on with this analysis, the next thing I would do is to convert my modelling to the `tidymodels` paradigm. Although there is a bit of a learning curve to get started, it should pay off in the long run since the framework is so widely applicable. `tidymodels` was designed to provide guide rails that promote good data modelling practices, as well as guard against common pitfalls. Using standardized tooling offloads some of the decision-making and implementation work we would otherwise need to do, freeing up our minds to focus on modelling questions (including potential sources of bias).
+
+I would also use `renv` to further improve reproducibility (I didn't want to try it here, as the increased complexity might make it more difficult for peers to knit my file).
+
+\pagebreak
+
+# Appendix {#sec-appendix}
+
+## Appendix A $\blacktriangleright$ Session Info {#appendix-a}
+
+```{r session-info}
+sessionInfo()
+```
+
+```{r echo=FALSE}
+model_plot_labs <- list("Residuals vs Fitted", "Normal Q-Q",
+       "Scale-Location", "Cook's distance",
+       "Residuals vs Leverage",
+       "Cook's dist vs Leverage $h_{ii} / (1 - h_{ii})$")
+```
+
+## Appendix B $\blacktriangleright$ Model diagnostics {#appendix-b}
+
+Here is the output of `plot.lm()` (i.e. `plot(fitted_model)`) for the final model.
+
+```{r fig-model-diagnostics, fig.align="center", fig.cap=model_plot_labs, out.width="80%"}
+plot(model_v3_filtered, which=1:6)
+```
+:::
+
+[^1]: Available by searching for "NYPD Shooting Incident Data (Historic)" at <https://catalog.data.gov/dataset>.
+
+[^2]: Available by searching for "NYPD Shooting Incident Data (Historic)" at <https://catalog.data.gov/dataset>.
+
+[^3]: <https://data.cityofnewyork.us/api/views/833y-fsy8/files/f5f61d94-6961-47bd-8d3c-e57ebeb4cb55?download=true&filename=NYPD_Shootings_Historic_DataDictionary.xlsx>
+
+[^4]: <https://r4ds.had.co.nz/tidy-data.html>
+
+[^5]: <https://data.cityofnewyork.us/Public-Safety/NYPD-Shooting-Incident-Data-Historic-/833y-fsy8>
+
+[^6]: <https://www.weather.gov/media/okx/Climate/CentralPark/monthlyannualtemp.pdf>
+
+[^7]: <https://en.wikipedia.org/wiki/New_York_City_Police_Commissioner>
+
+[^8]: `r model_adj_rs(model_v3, format = "percent")` of the variance in `log(incident_reports)` is explained by `commissioner`, `commissioner:date` and `temperature`
+
+[^9]: <https://en.wikipedia.org/wiki/COVID-19_pandemic_in_New_York_City#Police_and_crime>
