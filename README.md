@@ -9,5 +9,5 @@
 
 Knitting to either HTML or PDF should work. I suggest knitting to HTML, for simplicity. 
 
-1. With the Rmd file from step 1 open in RStudio, select `Knit` > `Knit to HTML`.
+1. With [nypd_shooting_report_alenters.Rmd](nypd_shooting_report_alenters.Rmd) open in RStudio, select `Knit` > `Knit to HTML`.
 2. Knitted file should either pop up in the Viewer or in an external window, depending on your system and settings.
