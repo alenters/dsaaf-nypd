@@ -1,7 +1,7 @@
 # NYPD Shooting Incident Data Report
 ## Setup
 
-1. Download `nypd_shooting_incident_data_report_alenters.Rmd`.
+1. Download `nypd_shooting_report_alenters.Rmd`.
 2. Open file in RStudio.
 3. Optionally, make sure necessary libraries are installed by running `install.packages(c("tidyverse", "broom", "knitr", "modelr"))`.
 
