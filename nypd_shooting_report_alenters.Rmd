@@ -33,7 +33,7 @@ You can find my data source overview in [Wrangle Data](#sec-wrangle-data), my mi
 
 Necessary packages are loaded via `library()`. Optional ones are loaded via `require()`.
 
-You can install the necessary packages on your machine by running `install.packages(c("tidyverse", "broom", "knitr", "modelr"))` in the console, and following the prompt to restart R (if requested). You may want to run this command even if you have them installed already, as I have found rendering works better with current versions of the packages. (You can see exactly which versions I used in the [Appendix A - Session Info](#appendix-a) section in my PDF version of this report.)
+You can install the necessary packages on your machine by running `install.packages(c("tidyverse", "broom", "knitr", "modelr"))` in the console, and following the prompt to restart R (if requested). You may want to run this command even if you have them installed already, as I have found that rendering works better with current versions of the packages. (You can see exactly which versions I used in the [Appendix A - Session Info](#appendix-a) section in my PDF/html version of this report.)
 
 ```{r setup}
 # necessary packages
