@@ -2,8 +2,8 @@
 title: "NYPD Shooting Incident Data Report"
 author: "A. Lenters"
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 ---
 
 # Overview {#sec-overview}
